@@ -19,17 +19,21 @@ import skimage.draw
 import sys
 import copy
 
-dtype = np.float32
+dtype = np.float64
 
 LINEAR_MODEL_VAR_X = 0.5
 LINEAR_MODEL_VAR_Y = 0.5
 ANGULAR_MODEL_VAR = 0.3
-SENSOR_MODEL_VAR = 5.0
-NUM_PARTICLES = 1000
+SENSOR_MODEL_VAR = 15.0
+NUM_PARTICLES = 2000
 
 
 @numba.jit(nopython=True)
 def _CastRay(p0, p1, grid_data):
+    '''
+    Cast a ray from p0 in the direction toward p1 and return the first cell the
+    sensor will detect.
+    '''
     delta = np.abs(np.array([p1[0] - p0[0], p1[1] - p0[1]]))
     p = p0.copy()
     n = 1 + np.sum(delta)
@@ -61,6 +65,10 @@ def _CastRay(p0, p1, grid_data):
 def _ComputeSimulatedRanges(scan_angles, scan_range_max, world_t_map,
                             map_t_particle, map_R_particle, grid_data,
                             grid_resolution):
+    '''
+    Cast rays in all directions and calculate distances to obstacles in all
+    directions from a given particle.
+    '''
     src_cell = ((map_t_particle - world_t_map) / grid_resolution).astype(
         np.int32)
 
@@ -90,7 +98,11 @@ def RotateBy(x, angle):
 
 
 class Pose(object):
-    '''2D pose representation.'''
+    '''
+    2D pose representation of robot w.r.t. world frame.
+    Given by the translation from origin to the robot, and then rotation to math
+    robot orientation.
+    '''
     def __init__(self, rotation=0, translation=[0, 0]):
         self.rotation = rotation
         self.translation = np.array(translation, dtype=dtype)
@@ -112,15 +124,12 @@ class Pose(object):
         msg.orientation.w = np.cos(self.rotation / 2)
         return msg
 
-    def __mul__(self, v):
-        return RotateBy(v, self.angle) + self.translation
-
-    def Inverse(self):
-        return Pose(-self.angle, np.dot(self.rotation, -self.transtranslation))
-
 
 class Grid(object):
-    '''Occupancy grid representation, with coordinate helpers.'''
+    '''
+    Occupancy grid representation, with coordinate helpers.
+    World is global coordinate frame and grid is index-based array coordinates.
+    '''
     def __init__(self, grid_msg):
         self.cols = grid_msg.info.width
         self.rows = grid_msg.info.height
@@ -155,7 +164,10 @@ class Grid(object):
 
 
 class Scan(object):
-    '''Scan representation / cache.'''
+    '''
+    Scan representation / cache.
+    Scan consists of angles and distances (ranges).
+    '''
     def __init__(self, scan_msg):
         angle_min = scan_msg.angle_min
         angle_max = scan_msg.angle_max
@@ -206,27 +218,30 @@ class Particle(object):
         #  2. Add noise to the velocity, with component variance
         #     LINEAR_MODEL_VAR_X and LINEAR_MODEL_VAR_Y
         #  3. Transform the linear velocity into map frame (use the provided
-        #     RotateBy() function)
-        #  4. Integrate the linear velocity to the particle pose
+        #     RotateBy() function). The current pose of the particle, in map
+        #     frame, is stored in self.map_T_particle
+        #  4. Integrate the linear velocity to the particle pose, stored in
+        #     self.map_T_particle.translation
         #  5. Extract the particle's rotational velocity
         #     (odom_msg.twist.twist.angular.z)
         #  6. Add noise to the rotational velocity, with variance
         #     ANGULAR_MODEL_VAR
-        #  7. Integrate the rotational velocity into the particle pose
+        #  7. Integrate the rotational velocity into the particle pose, stored
+        #     in self.map_T_particle.rotation
         #
         ##########
+	xvel = odom_msg.twist.twist.linear.x
+	yvel = odom_msg.twist.twist.linear.y
 
-	x_vel,y_vel = odom_msg.twist.twist.linear()
-	
-	xvel +=  np.random.normal(0,LINEAR_MODEL_VAR_X)
-	yvel += np.random.normal(0,LINEAR_MODEL_VAR_Y)
-	
-	angle = dt*odom_msg.twist.twist.angular.z
-	X = np.array([x_vel,y_vel])
-	self.map_T_particle.translation = self.map_T_particle.__mul__(X)
-	self.map_T_particle.rotation += angle + np.random.normal(0,ANGUALR_MODEL_VAR)
+	xvel += np.random.normal(0, LINEAR_MODEL_VAR_X)
+	yvel += np.random.normal(0, LINEAR_MODEL_VAR_Y)
 
-	
+	X = np.array([dt*xvel, dt*yvel])
+	self.map_T_particle.translation += RotateBy(X, self.map_T_particle.rotation)
+
+	w = (odom_msg.twist.twist.angular.z + np.random.normal(0, ANGULAR_MODEL_VAR))*dt
+	self.map_T_particle.rotation += w
+
     def _ComputeSimulatedRanges(self, scan):
         translation = self.map_T_particle.translation
         rotation = self.map_T_particle.rotation
@@ -236,6 +251,9 @@ class Particle(object):
                                        self.grid.resolution)
 
     def UpdateScan(self, scan):
+        '''
+        Calculate weights of particles according to scan / map matching.
+        '''
         sim_ranges = self._ComputeSimulatedRanges(scan)
 
         ##########
@@ -245,31 +263,27 @@ class Particle(object):
         #  1. Compute the likelihood of each beam, compared to sim_ranges. The
         #     true measurement vector is in scan.ranges. Use the Gaussian PDF
         #     formulation.
-        #  2. Assign the weight of this particle as the sum of these
-        #     probabilities.
-        #
-        #  Note: normalizing the PDF isn't necessary, since this is normalized
-        #  later and every calculation has the same variance
+        #  2. Assign the weight of this particle as the product of these
+        #     probabilities. Store this value in self.weight.
         #
         ##########
 	
-	t1 = np.pow(2*np.pi*SENSOR_MODEL_VA,-0.5)
-	denom = 2*SENSOR_MODEL_VA
+	p = []
+	t1 = np.power(2*np.pi*SENSOR_MODEL_VAR,0.5)
+	denom = 2*SENSOR_MODEL_VAR
 	for i in range(len(scan.ranges)):
-		r[i] = np.pow(scan.ranges[i]-sim_ranges[i], 2)
-		p[i] = t1 * np.exp(r[i]/denom)
-	self.weight = np.sum(p)
-	
-
+		k = np.power(scan.ranges[i]-sim_ranges[i], 2)
+		p.append(np.exp(-k/denom)/t1)
+	self.weight = np.prod(p)
 
 class ParticleFilter(object):
     def __init__(self, grid, num_particles):
         self.grid = grid
         self.last_timestamp = None
         self.particles = [Particle(grid) for _ in range(num_particles)]
-        self.publisher = rospy.Publisher("pose_hypotheses".format(id(self)),
-                                         geometry_msgs.msg.PoseArray,
-                                         queue_size=10)
+        self.pose_publisher = rospy.Publisher("pose_hypotheses",
+                                              geometry_msgs.msg.PoseArray,
+                                              queue_size=10)
         self.scan_publisher = rospy.Publisher("lidar",
                                               sensor_msgs.msg.LaserScan,
                                               queue_size=10)
@@ -331,22 +345,20 @@ class ParticleFilter(object):
         #
         ##########
 	ndp = []
-	nu = 0
+	nu = 0.0
+	new_particle = []
 	for i in range(0,len(self.particles)):
 		nu+= self.particles[i].weight
 	for i in range(0,len(self.particles)):
-		ndp.appendd(self.particles[i].weight/nu)
+		ndp.append(self.particles[i].weight/nu)
 	
-	
-	next_particles = np.random.choice(self.particles,size=(len(self.particles)),p=ndp)
-	self.particles = next_particles.copy.deepcopy()
-
-	
-	
-	
+	next_particle = np.random.choice(len(self.particles),size=(len(self.particles)),p=ndp)
+	for i in range(0, len(self.particles)):
+		new_particle.append(copy.deepcopy(self.particles[next_particle[i]]))
+	self.particles = new_particle
 
         # Publish cloud for visualization.
-        self.publisher.publish(self.GetPoseArray())
+        self.pose_publisher.publish(self.GetPoseArray())
         avg_pose = self.GetMeanPose()
         avg_trans = (avg_pose.translation[0], avg_pose.translation[1], 0)
         avg_quat = tf.transformations.quaternion_from_euler(
